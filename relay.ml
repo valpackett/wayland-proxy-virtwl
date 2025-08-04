@@ -151,11 +151,13 @@ end
 type ('a, 'role) user_data =
   | Client_data      : 'a CD.t -> ('a, [`Server]) user_data
   | Host_data        : 'a HD.t -> ('a, [`Client]) user_data
+  | Internal_data    : ('a, [`Client]) user_data
 
 type ('a, 'role) Wayland.S.user_data += Relay of ('a, 'role) user_data
 
 let host_data x = Relay (Host_data x)
 let client_data x = Relay (Client_data x)
+let [@warning "-32"] internal_data = Relay Internal_data
 
 let user_data (proxy : ('a, _, 'role) Proxy.t) : ('a, 'role) user_data =
   match Wayland.Proxy.user_data proxy with
@@ -163,9 +165,8 @@ let user_data (proxy : ('a, _, 'role) Proxy.t) : ('a, 'role) user_data =
   | S.No_data -> Fmt.failwith "No data attached to %a!" Proxy.pp proxy
   | _ -> Fmt.failwith "Unexpected data attached to %a!" Proxy.pp proxy
 
-let to_client (type a) (h : (a, 'v, [`Client]) Proxy.t) : (a, 'v, [`Server]) Proxy.t =
+let to_client_data (type a) (data : a HD.t) : (a, 'v, [`Server]) Proxy.t =
   let cv = Proxy.cast_version in
-  let Host_data data = user_data h in
   let open HD in
   match data with
   | Output c -> cv c
@@ -175,6 +176,14 @@ let to_client (type a) (h : (a, 'v, [`Client]) Proxy.t) : (a, 'v, [`Server]) Pro
   | Gtk_data_offer _ ->
     (* Here, a client Gtk corresponds to a host Zwp, so the types aren't right. *)
     failwith "Can't use to_client with GTK translation"
+
+let to_client (type a) (h : (a, 'v, [`Client]) Proxy.t) : (a, 'v, [`Server]) Proxy.t option =
+  match user_data h with
+  | Host_data data -> Option.some @@ to_client_data data
+  | Internal_data -> Option.none
+
+let with_client (type a) (h : (a, 'v, [`Client]) Proxy.t) (f : (a, 'v, [`Server]) Proxy.t -> unit) =
+  Option.iter f @@ to_client h
 
 let to_host (type a) (c : (a, 'v, [`Server]) Proxy.t) : (a, 'v, [`Client]) Proxy.t =
   let cv = Proxy.cast_version in
@@ -545,8 +554,8 @@ let make_surface ~xwayland ~host_surface c =
     host_surface @@ object
       inherit [_] H.Wl_surface.v1
       method! user_data = user_data
-      method on_enter _ ~output = C.Wl_surface.enter c ~output:(to_client output)
-      method on_leave _ ~output = C.Wl_surface.leave c ~output:(to_client output)
+      method on_enter _ ~output = with_client output @@ fun output -> C.Wl_surface.enter c ~output
+      method on_leave _ ~output = with_client output @@ fun output -> C.Wl_surface.leave c ~output
       method on_preferred_buffer_scale _ = C.Wl_surface.preferred_buffer_scale c
       method on_preferred_buffer_transform _ ~transform =
         C.Wl_surface.preferred_buffer_transform c ~transform
@@ -715,12 +724,14 @@ let make_surface ~xwayland ~host_surface c =
     )
 
 let set_surface_data surface data =
-  let Host_data (HD.Surface x) = user_data surface in
-  x.data <- data
+  match user_data surface with
+  | Host_data (HD.Surface x) -> x.data <- data
+  | Internal_data -> failwith "called on internal object"
 
 let get_surface_data surface =
-  let Host_data (HD.Surface x) = user_data surface in
-  x.data
+  match user_data surface with
+  | Host_data (HD.Surface x) -> x.data
+  | Internal_data -> failwith "called on internal object"
 
 let make_compositor ~xwayland bind proxy =
   let h = bind @@ new H.Wl_compositor.v1 in
@@ -892,7 +903,8 @@ let make_pointer t ~xwayland ~host_seat c =
         update_serial t serial;
         let (surface_x, surface_y) = point_to_client ~xwayland (surface_x, surface_y) in
         let forward_event () =
-          C.Wl_pointer.enter c ~serial ~surface:(to_client surface) ~surface_x ~surface_y
+          with_client surface @@ fun surface ->
+            C.Wl_pointer.enter c ~serial ~surface ~surface_x ~surface_y
         in
         match xwayland with
         | None -> forward_event ()
@@ -901,7 +913,8 @@ let make_pointer t ~xwayland ~host_seat c =
 
       method on_leave _ ~serial ~surface =
         update_serial t serial;
-        C.Wl_pointer.leave c ~serial ~surface:(to_client surface)
+        with_client surface @@ fun surface ->
+          C.Wl_pointer.leave c ~serial ~surface
 
       method on_motion _ ~time ~surface_x ~surface_y =
         let (surface_x, surface_y) = point_to_client ~xwayland (surface_x, surface_y) in
@@ -932,9 +945,10 @@ let make_touch t ~xwayland ~host_seat c =
   let h : _ Proxy.t = H.Wl_seat.get_touch host_seat @@ object
       inherit [_] H.Wl_touch.v1
 
-      method on_down _ ~serial ~time ~surface =
+      method on_down _ ~serial ~time ~surface ~id ~x ~y =
         update_serial t serial;
-        C.Wl_touch.down c ~serial ~time ~surface:(to_client surface)
+        with_client surface @@ fun surface ->
+          C.Wl_touch.down c ~serial ~time ~surface ~id ~x ~y
 
       method on_up _ ~serial =
         update_serial t serial;
@@ -967,7 +981,8 @@ let make_keyboard t ~xwayland ~host_seat c =
       method on_enter _ ~serial ~surface ~keys =
         update_serial t serial;
         let forward_event () =
-          C.Wl_keyboard.enter c ~serial ~surface:(to_client surface) ~keys
+          with_client surface @@ fun surface ->
+            C.Wl_keyboard.enter c ~serial ~surface ~keys
         in
         match xwayland with
         | None -> forward_event ()
@@ -976,7 +991,8 @@ let make_keyboard t ~xwayland ~host_seat c =
 
       method on_leave _ ~serial ~surface =
         update_serial t serial;
-        C.Wl_keyboard.leave c ~serial ~surface:(to_client surface);
+        with_client surface (fun surface ->
+          C.Wl_keyboard.leave c ~serial ~surface);
         xwayland |> Option.iter (fun (xwayland : xwayland_hooks) ->
             xwayland#on_keyboard_leave ~surface
           )
@@ -1698,8 +1714,9 @@ let make_data_device ~xwayland ~host_device c =
       method on_drop _ = C.Wl_data_device.drop c
 
       method on_enter _ ~serial ~surface ~x ~y offer =
-        let (x, y) = point_to_client ~xwayland (x, y) in
-        C.Wl_data_device.enter c ~serial ~surface:(to_client surface) ~x ~y (Option.map to_client offer)
+        with_client surface @@ fun surface ->
+          let (x, y) = point_to_client ~xwayland (x, y) in
+          C.Wl_data_device.enter c ~serial ~surface ~x ~y (Option.bind offer to_client)
 
       method on_leave _ = C.Wl_data_device.leave c
 
@@ -1707,7 +1724,7 @@ let make_data_device ~xwayland ~host_device c =
         let (x, y) = point_to_client ~xwayland (x, y) in
         C.Wl_data_device.motion c ~time ~x ~y
 
-      method on_selection _ offer = C.Wl_data_device.selection c (Option.map to_client offer)
+      method on_selection _ offer = C.Wl_data_device.selection c (Option.bind offer to_client)
     end in
   Proxy.Handler.attach c @@ object
     inherit [_] C.Wl_data_device.v1
@@ -1790,10 +1807,10 @@ module Gtk_primary = struct
         method on_data_offer _ offer = make_gtk_data_offer ~client_offer:(C.Gtk_primary_selection_device.data_offer c) offer
         method on_selection _ offer =
           let to_client x =
-            let Host_data data = user_data x in
-            match data with
-            | HD.Gtk_data_offer c -> cv c
-            | HD.Zwp_data_offer _ -> failwith "Can't mix Zwp and Gtk selection protocols!"
+            match user_data x with
+            | Host_data (HD.Gtk_data_offer c) -> cv c
+            | Host_data (HD.Zwp_data_offer _) -> failwith "Can't mix Zwp and Gtk selection protocols!"
+            | Internal_data -> failwith "called on internal object"
           in
           C.Gtk_primary_selection_device.selection c (Option.map to_client offer)
       end in
@@ -1885,10 +1902,10 @@ let make_swipe_gesture t ~host_swipe_gesture c =
   let h = host_swipe_gesture @@ object
       inherit [_] H.Zwp_pointer_gesture_swipe_v1.v1
 
-      method on_begin _ ~serial ~time ~surface =
-        let surface = to_client surface in
-        update_serial t serial;
-        C.Zwp_pointer_gesture_swipe_v1.begin_ c ~serial ~time ~surface
+      method on_begin _ ~serial ~time ~surface ~fingers =
+        with_client surface @@ fun surface ->
+          update_serial t serial;
+          C.Zwp_pointer_gesture_swipe_v1.begin_ c ~serial ~time ~surface ~fingers
 
       method on_update _ = C.Zwp_pointer_gesture_swipe_v1.update c
 
@@ -1905,10 +1922,10 @@ let make_pinch_gesture t ~host_pinch_gesture c =
   let h = host_pinch_gesture @@ object
       inherit [_] H.Zwp_pointer_gesture_pinch_v1.v1
 
-      method on_begin _ ~serial ~time ~surface =
-        let surface = to_client surface in
-        update_serial t serial;
-        C.Zwp_pointer_gesture_pinch_v1.begin_ c ~serial ~time ~surface
+      method on_begin _ ~serial ~time ~surface ~fingers =
+        with_client surface @@ fun surface ->
+          update_serial t serial;
+          C.Zwp_pointer_gesture_pinch_v1.begin_ c ~serial ~time ~surface ~fingers
 
       method on_update _ = C.Zwp_pointer_gesture_pinch_v1.update c
 
@@ -1925,10 +1942,10 @@ let make_hold_gesture t ~host_hold_gesture c =
   let h = host_hold_gesture @@ object
       inherit [_] H.Zwp_pointer_gesture_hold_v1.v1
 
-      method on_begin _ ~serial ~time ~surface =
-        let surface = to_client surface in
-        update_serial t serial;
-        C.Zwp_pointer_gesture_hold_v1.begin_ c ~serial ~time ~surface
+      method on_begin _ ~serial ~time ~surface ~fingers =
+        with_client surface @@ fun surface ->
+          update_serial t serial;
+          C.Zwp_pointer_gesture_hold_v1.begin_ c ~serial ~time ~surface ~fingers
 
       method on_end _ ~serial =
         update_serial t serial;
@@ -2012,7 +2029,7 @@ module Zwp_primary = struct
     let h = host_device @@ object
         inherit [_] H.Zwp_primary_selection_device_v1.v1
         method on_data_offer _ offer = make_data_offer ~client_offer:(C.Zwp_primary_selection_device_v1.data_offer c) offer
-        method on_selection _ offer = C.Zwp_primary_selection_device_v1.selection c (Option.map to_client offer)
+        method on_selection _ offer = C.Zwp_primary_selection_device_v1.selection c (Option.bind offer to_client)
       end in
     Proxy.Handler.attach c @@ object
       inherit [_] C.Zwp_primary_selection_device_v1.v1
