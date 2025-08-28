@@ -131,13 +131,18 @@ module CD = struct
     mutable client_memory : Cstruct.t;
   }
 
+  type 'v xdg_toplevel = {
+    host_xdg_toplevel : 'v H.Xdg_toplevel.t;
+    (* host_surface : 'v H.Wl_surface.t; *)
+  }
+
   type 'a t =
     | Region               : 'v H.Wl_region.t                       -> [`Wl_region]                       t
     | Surface              : 'v surface                             -> [`Wl_surface]                      t
     | Buffer               : 'v buffer                              -> [`Wl_buffer]                       t
     | Seat                 : 'v H.Wl_seat.t                         -> [`Wl_seat]                         t
     | Output               : 'v H.Wl_output.t                       -> [`Wl_output]                       t
-    | Toplevel             : 'v H.Xdg_toplevel.t                    -> [`Xdg_toplevel]                    t
+    | Toplevel             : 'v xdg_toplevel                        -> [`Xdg_toplevel]                    t
     | Xdg_surface          : 'v H.Xdg_surface.t                     -> [`Xdg_surface]                     t
     | Xdg_positioner       : 'v H.Xdg_positioner.t                  -> [`Xdg_positioner]                  t
     | Data_source          : 'v H.Wl_data_source.t                  -> [`Wl_data_source]                  t
@@ -193,7 +198,7 @@ let to_host (type a) (c : (a, 'v, [`Server]) Proxy.t) : (a, 'v, [`Client]) Proxy
   | Seat x -> cv x
   | Output x -> cv x
   | Region x -> cv x
-  | Toplevel x -> cv x
+  | Toplevel x -> cv x.host_xdg_toplevel
   | Xdg_surface x -> cv x
   | Xdg_positioner x -> cv x
   | Data_source x -> cv x
@@ -1281,7 +1286,8 @@ end
 let validate_serial ~(untrusted_serial: int32) = untrusted_serial
 (** TODO: do actual validation here! *)
 
-let make_popup ~host_popup c =
+let make_popup ~deco ~host ~host_surface ~host_popup c =
+  deco := Option.some @@ Decorations.create_proxy_decorator ~host ~host_surface ~host_toplevel:None ~internal_data;
   let h = host_popup @@ object
       inherit [_] H.Xdg_popup.v1
       method on_popup_done _ = C.Xdg_popup.popup_done c
@@ -1300,16 +1306,27 @@ let make_popup ~host_popup c =
       H.Xdg_popup.reposition h ~positioner:(to_host positioner) ~token:untrusted_token
   end
 
-let make_toplevel ~tag ~host_toplevel c =
+let make_toplevel ~tag ~deco ~host ~host_surface ~host_toplevel c =
   let h = host_toplevel @@ object
       inherit [_] H.Xdg_toplevel.v1
       method on_close _ = C.Xdg_toplevel.close c
-      method on_configure _ = C.Xdg_toplevel.configure c
+      method on_configure _ ~width ~height ~states:_ =
+        (* TODO: parse original state? *)
+        let cs = Cstruct.create 8 in
+        Cstruct.HE.set_uint32 cs 0 1l;
+        Cstruct.HE.set_uint32 cs 4 @@ C.Xdg_toplevel.State.to_int32 C.Xdg_toplevel.State.Tiled_top;
+        (* TODO: ask deco *)
+        let (width, height) = (Int32.sub width 12l, Int32.sub height 30l) in
+        C.Xdg_toplevel.configure c ~width ~height ~states:(Cstruct.to_string cs)
       method on_configure_bounds _ = C.Xdg_toplevel.configure_bounds c
       method on_wm_capabilities _ = C.Xdg_toplevel.wm_capabilities c
     end
   in
-  let user_data = client_data (Toplevel h) in
+  deco := Option.some @@ Decorations.create_proxy_decorator ~host ~host_surface ~host_toplevel:(Some h) ~internal_data;
+  let data =
+    { CD.host_xdg_toplevel = h; (*host_surface = host_surface*) }
+  in
+
   Proxy.Handler.attach c @@ object
     val h = h
     val mutable min_width = 0
@@ -1317,7 +1334,7 @@ let make_toplevel ~tag ~host_toplevel c =
     val mutable max_width = 0
     val mutable max_height = 0
     inherit [_] C.Xdg_toplevel.v1
-    method! user_data = user_data
+    method! user_data = client_data (Toplevel data)
     method on_destroy = delete_with H.Xdg_toplevel.destroy h
     method on_move _ ~seat ~(untrusted_serial:int32): unit =
       let serial = validate_serial ~untrusted_serial in
@@ -1376,7 +1393,8 @@ let make_toplevel ~tag ~host_toplevel c =
     method on_unset_maximized _ = H.Xdg_toplevel.unset_maximized h
   end
 
-let make_xdg_surface ~tag ~host_xdg_surface c =
+let make_xdg_surface ~tag ~host ~host_surface ~host_xdg_surface c =
+  let deco = ref None in
   let c = cv c in
   let h = host_xdg_surface @@ object
       inherit [_] H.Xdg_surface.v1
@@ -1400,14 +1418,19 @@ let make_xdg_surface ~tag ~host_xdg_surface c =
       V.check_x_y p C.Xdg_surface.Errors.invalid_size ~untrusted_x ~untrusted_y;
 
       let (x, y, width, height) = (untrusted_x, untrusted_y, untrusted_width, untrusted_height) in
-      H.Xdg_surface.set_window_geometry h ~x ~y ~width ~height
+      if width < 16384l then (
+        Option.iter (fun d ->
+          let (x, y, width, height) = d#on_bbox_changed @@ Decorations.bbox_of (x, y, width, height) in
+          H.Xdg_surface.set_window_geometry h ~x ~y ~width ~height
+        ) !deco;
+      )
 
-    method on_get_toplevel _ = make_toplevel ~tag ~host_toplevel:(H.Xdg_surface.get_toplevel h)
+    method on_get_toplevel _ = make_toplevel ~tag ~deco ~host ~host_surface ~host_toplevel:(H.Xdg_surface.get_toplevel h)
 
     method on_get_popup _ popup ~parent ~positioner =
       let parent = Option.map to_host parent in
       let positioner = to_host positioner in
-      make_popup ~host_popup:(H.Xdg_surface.get_popup h ~parent ~positioner) popup
+      make_popup ~deco ~host ~host_surface ~host_popup:(H.Xdg_surface.get_popup h ~parent ~positioner) popup
   end
 
 let make_positioner ~host_positioner c =
@@ -1464,7 +1487,7 @@ let make_positioner ~host_positioner c =
       H.Xdg_positioner.set_parent_configure h ~serial
   end
 
-let make_xdg_wm_base ~xwayland ~tag bind proxy =
+let make_xdg_wm_base ~xwayland ~tag ~host bind proxy =
   let pong_handlers = Queue.create () in
   let h = bind @@ object
       inherit [_] H.Xdg_wm_base.v1
@@ -1488,8 +1511,9 @@ let make_xdg_wm_base ~xwayland ~tag bind proxy =
     method on_create_positioner _ = make_positioner ~host_positioner:(H.Xdg_wm_base.create_positioner h)
 
     method on_get_xdg_surface _ xdg_surface ~surface =
-      let host_xdg_surface = H.Xdg_wm_base.get_xdg_surface h ~surface:(to_host surface) in
-      make_xdg_surface ~tag ~host_xdg_surface xdg_surface
+      let host_surface = to_host surface in
+      let host_xdg_surface = H.Xdg_wm_base.get_xdg_surface h ~surface:host_surface in
+      make_xdg_surface ~tag ~host ~host_surface ~host_xdg_surface xdg_surface
   end;
   xwayland |> Option.iter (fun (x:xwayland_hooks) ->
       x#set_ping (fun () ->
@@ -1539,7 +1563,7 @@ let make_zxdg_output_manager_v1 ~xwayland bind proxy =
 let make_kde_decoration ~host_decoration c =
   let h = host_decoration @@ object
       inherit [_] H.Org_kde_kwin_server_decoration.v1
-      method on_mode _ = C.Org_kde_kwin_server_decoration.mode c
+      method on_mode _ ~mode:_ = C.Org_kde_kwin_server_decoration.mode c ~mode:2l
     end
   in
   Proxy.Handler.attach c @@ object
@@ -1556,7 +1580,7 @@ let make_kde_decoration ~host_decoration c =
 let make_kde_decoration_manager bind c =
   let h = bind @@ object
       inherit [_] H.Org_kde_kwin_server_decoration_manager.v1
-      method on_default_mode _ = C.Org_kde_kwin_server_decoration_manager.default_mode c
+      method on_default_mode _ ~mode:_ = C.Org_kde_kwin_server_decoration_manager.default_mode c ~mode:2l
     end
   in
   Proxy.Handler.attach c @@ object
@@ -1569,7 +1593,7 @@ let make_kde_decoration_manager bind c =
 let make_xdg_decoration ~host_decoration c =
   let h = host_decoration @@ object
       inherit [_] H.Zxdg_toplevel_decoration_v1.v1
-      method on_configure _ = C.Zxdg_toplevel_decoration_v1.configure c
+      method on_configure _ ~mode:_ = C.Zxdg_toplevel_decoration_v1.configure c ~mode:2l
     end
   in
   Proxy.Handler.attach c @@ object
@@ -2127,7 +2151,7 @@ let make_registry ~xwayland t reg =
       | Wl_data_device_manager.T -> make_data_device_manager ~xwayland bind proxy
       | Gtk_primary_selection_device_manager.T -> Gtk_primary.make_device_manager bind proxy
       | Zwp_primary_selection_device_manager_v1.T -> Zwp_primary.make_device_manager bind proxy
-      | Xdg_wm_base.T -> make_xdg_wm_base ~xwayland ~tag:t.config.tag bind proxy
+      | Xdg_wm_base.T -> make_xdg_wm_base ~xwayland ~tag:t.config.tag ~host:t.host bind proxy
       | Zxdg_output_manager_v1.T -> make_zxdg_output_manager_v1 ~xwayland bind proxy
       | Org_kde_kwin_server_decoration_manager.T -> make_kde_decoration_manager bind proxy
       | Zxdg_decoration_manager_v1.T -> make_xdg_decoration_manager bind proxy
