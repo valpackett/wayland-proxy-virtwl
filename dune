@@ -6,6 +6,6 @@
     (flags (:standard -Wall -Wextra -Werror)))
   (public_name wayland-proxy-virtwl)
   (preprocess (pps ppx_cstruct))
-  (libraries wayland wayland.protocols virtio_gpu memfd cmdliner fmt x11 eio_main))
+  (libraries wayland wayland.protocols virtio_gpu memfd cmdliner fmt x11 eio_main cairo2))
 
 (vendored_dirs ocaml-wayland)

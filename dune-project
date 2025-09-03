@@ -19,4 +19,5 @@
    (fmt (>= 0.8.9))
    conf-pkg-config
    (memfd (>= 0.1.0))
+   (cairo2 (>= 0.6.0))
    (wayland (>= 2.0))))

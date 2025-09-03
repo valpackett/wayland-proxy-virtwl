@@ -52,6 +52,15 @@
                 cmdliner
                 logs
                 memfd
+                (cairo2.overrideAttrs (old: {
+                  patches = [
+                    # allow drawing on mmap'ed files: https://github.com/Chris00/ocaml-cairo/pull/41
+                    (pkgs.fetchpatch {
+                      url = "https://github.com/Chris00/ocaml-cairo/commit/0c04668ad3f03bb78b18bf057e2f25d273055465.patch";
+                      hash = "sha256-7KzEjv6t02jZLDwBR1CiTwp3yrlcufBa0IJ5h/X+k1M=";
+                    })
+                  ];
+                }))
               ]);
             };
 
