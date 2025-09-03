@@ -1322,7 +1322,8 @@ let make_toplevel ~tag ~deco ~host ~host_surface ~host_toplevel c =
       method on_wm_capabilities _ = C.Xdg_toplevel.wm_capabilities c
     end
   in
-  deco := Option.some @@ Decorations.create_proxy_decorator ~host ~host_surface ~host_toplevel:(Some h) ~internal_data;
+  let decorator = Decorations.create_proxy_decorator ~host ~host_surface ~host_toplevel:(Some h) ~internal_data in
+  deco := Option.some @@ decorator;
   let data =
     { CD.host_xdg_toplevel = h; (*host_surface = host_surface*) }
   in
@@ -1383,7 +1384,9 @@ let make_toplevel ~tag ~deco ~host ~host_surface ~host_toplevel c =
     method on_set_parent _ ~parent = H.Xdg_toplevel.set_parent h ~parent:(Option.map to_host parent)
     method on_set_title _ ~(untrusted_title:string) : unit =
       (* TODO: sanitize title using a C library. *)
-      H.Xdg_toplevel.set_title h ~title:(tag ^ untrusted_title)
+      let title = tag ^ untrusted_title in
+      H.Xdg_toplevel.set_title h ~title;
+      decorator#on_title_set title
     method on_show_window_menu p ~seat ~(untrusted_serial:int32)
              ~(untrusted_x:int32) ~(untrusted_y:int32): unit =
       V.check_x_y p C.Xdg_toplevel.Errors.invalid_size ~untrusted_x ~untrusted_y;

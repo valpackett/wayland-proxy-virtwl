@@ -110,6 +110,7 @@ and create_proxy_decorator ~(host: Host.t) ~host_surface ~host_toplevel ~interna
       width = Int32.of_int 1280;
       height = Int32.of_int 720;
     }
+    val mutable title = ""
 
     (* TODO: figure out buffer reuse and dealloc *)
     method redraw () =
@@ -129,11 +130,17 @@ and create_proxy_decorator ~(host: Host.t) ~host_surface ~host_toplevel ~interna
         end
       in
       H.Wl_shm_pool.destroy pool;
-      for row = 0 to (Int32.to_int height) - 1 do
-        for col = 0 to (Int32.to_int width) - 1 do
-          data.{row, col} <- 0xFFfba6e1l
-        done
-      done;
+      let image = Cairo.Image.create_for_data32 data ~w:(Int32.to_int width) ~h:(Int32.to_int height) in
+      let cr = Cairo.create image in
+      Cairo.set_source_rgb cr 0.9 0.6 0.8;
+      Cairo.rectangle cr 0. 0. ~w:(Float.of_int @@ Int32.to_int width) ~h:(Float.of_int @@ Int32.to_int height);
+      Cairo.fill cr;
+      Cairo.set_source_rgb cr 0.06 0.2 0.1;
+      Cairo.select_font_face cr "Adwaita Sans" ~weight:Bold;
+      Cairo.set_font_size cr 14.0;
+      Cairo.move_to cr 10. 18.;
+      Cairo.show_text cr title;
+      Cairo.Surface.finish image;
       H.Wl_surface.attach surface ~buffer:(Some buffer) ~x:0l ~y:0l;
       H.Wl_surface.damage surface ~x:0l ~y:0l ~width:Int32.max_int ~height:Int32.max_int;
       H.Wl_subsurface.set_position subsurface ~x:(Int32.sub bounds.x border_size) ~y:(Int32.sub bounds.y top_size);
@@ -147,6 +154,11 @@ and create_proxy_decorator ~(host: Host.t) ~host_surface ~host_toplevel ~interna
        Int32.sub newbounds.y top_size,
        Int32.add newbounds.width (Int32.add border_size border_size),
        Int32.add newbounds.height (Int32.add top_size border_size));
+
+    method on_title_set newtitle =
+      title <- newtitle;
+      self#redraw ();
+      Client.sync host.display;
 
     method on_pointer_frame x y left_click =
       match host_toplevel with
